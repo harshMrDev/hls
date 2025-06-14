@@ -14,7 +14,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 class StreamBot:
     def __init__(self):
-        self.current_time = "2025-06-14 11:46:27"
+        self.current_time = "2025-06-14 12:07:00"
         self.current_user = "harshMrDev"
         self.base_dir = "/tmp/stream_downloads"
         self.chunk_size = 1024 * 1024  # 1MB chunks
@@ -192,9 +192,14 @@ class StreamBot:
                 raise Exception(f"Segment count mismatch: expected {expected_count}, got {actual_count}")
 
             # Merge segments
+            total_mb = sum(os.path.getsize(f) for f in segment_files) / (1024 * 1024)
+            estimated_minutes = max(1, int(total_mb / 50))  # Rough estimate: 50MB per minute
+            
             await msg.edit_text(
-                "🔄 Merging video segments...\n"
-                "⏳ This might take a few minutes..."
+                f"🔄 Merging video segments...\n"
+                f"📦 Total size: {total_mb:.1f}MB\n"
+                f"⏱️ Estimated time: {estimated_minutes} minutes\n"
+                f"⌛ Please wait..."
             )
             await self._merge_segments(segment_files, output_file)
 
@@ -224,11 +229,12 @@ class StreamBot:
             
             # Verify segments exist before creating concat file
             existing_segments = []
+            total_size = 0
             for segment in segment_files:
                 if os.path.exists(segment) and os.path.getsize(segment) > 0:
-                    # Use absolute paths and escape spaces
                     abs_path = os.path.abspath(segment)
                     existing_segments.append(abs_path)
+                    total_size += os.path.getsize(segment)
                 else:
                     raise Exception(f"Missing or empty segment: {segment}")
 
@@ -238,27 +244,23 @@ class StreamBot:
             # Create FFmpeg concat file with absolute paths
             with open(list_file, 'w', encoding='utf-8') as f:
                 for file in existing_segments:
-                    # Properly escape the path for FFmpeg
                     escaped_path = file.replace("'", "'\\''").replace('\\', '\\\\')
                     f.write(f"file '{escaped_path}'\n")
 
-            # Verify concat file
-            if not os.path.exists(list_file) or os.path.getsize(list_file) == 0:
-                raise Exception("Failed to create concat file")
-
-            # First try with concat demuxer
+            # Use direct TS concatenation for faster merging
             cmd = [
                 'ffmpeg',
                 '-f', 'concat',
                 '-safe', '0',
                 '-i', list_file,
-                '-c', 'copy',
-                '-movflags', '+faststart',
-                '-y',
+                '-c', 'copy',  # Copy without re-encoding
+                '-max_muxing_queue_size', '1024',  # Increase queue size
+                '-movflags', '+faststart+frag_keyframe+empty_moov',  # Optimize for streaming
+                '-y',  # Overwrite output
                 output_file
             ]
 
-            # Run FFmpeg
+            # Run FFmpeg with progress monitoring
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -266,9 +268,13 @@ class StreamBot:
             )
 
             try:
+                # Set a more reasonable timeout based on file size
+                # Allow roughly 1 minute per 100MB
+                timeout = max(300, (total_size / (100 * 1024 * 1024)) * 60)
+                
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(),
-                    timeout=300
+                    timeout=timeout
                 )
             except asyncio.TimeoutError:
                 if process:
@@ -276,53 +282,54 @@ class StreamBot:
                         process.kill()
                     except:
                         pass
-                raise Exception("FFmpeg merge timeout")
+                raise Exception(f"FFmpeg merge timeout after {int(timeout/60)} minutes")
 
-            # If concat demuxer fails, try alternative method
             if process.returncode != 0:
-                # Create a file list for direct concatenation
-                segment_list = '|'.join(existing_segments)
-                
-                cmd = [
-                    'ffmpeg',
-                    '-i', f"concat:{segment_list}",
-                    '-c', 'copy',
-                    '-movflags', '+faststart',
-                    '-y',
-                    output_file
-                ]
-
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-
+                # If concat fails, try direct concatenation
+                concat_file = f"{output_file}.ts"
                 try:
+                    # Concatenate TS files directly
+                    with open(concat_file, 'wb') as outfile:
+                        for segment in existing_segments:
+                            with open(segment, 'rb') as infile:
+                                shutil.copyfileobj(infile, outfile)
+
+                    # Convert concatenated TS to MP4
+                    cmd = [
+                        'ffmpeg',
+                        '-i', concat_file,
+                        '-c', 'copy',
+                        '-max_muxing_queue_size', '1024',
+                        '-movflags', '+faststart',
+                        '-y',
+                        output_file
+                    ]
+
+                    process = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+
                     stdout, stderr = await asyncio.wait_for(
                         process.communicate(),
-                        timeout=300
+                        timeout=timeout
                     )
-                except asyncio.TimeoutError:
-                    if process:
-                        try:
-                            process.kill()
-                        except:
-                            pass
-                    raise Exception("FFmpeg alternative merge timeout")
 
-                if process.returncode != 0:
-                    error_msg = stderr.decode().strip() if stderr else "Unknown FFmpeg error"
-                    raise Exception(f"Both merge methods failed: {error_msg}")
+                    if process.returncode != 0:
+                        error_msg = stderr.decode().strip() if stderr else "Unknown FFmpeg error"
+                        raise Exception(f"Both merge methods failed: {error_msg}")
+
+                finally:
+                    if os.path.exists(concat_file):
+                        os.remove(concat_file)
 
             # Verify output
             if not os.path.exists(output_file):
                 raise Exception("Merged file not found")
 
             output_size = os.path.getsize(output_file)
-            total_input_size = sum(os.path.getsize(f) for f in existing_segments)
-
-            if output_size < total_input_size * 0.5:
+            if output_size < total_size * 0.5:
                 raise Exception("Merged file too small")
 
         except Exception as e:
