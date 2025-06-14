@@ -6,6 +6,7 @@ import aiofiles
 import asyncio
 import hashlib
 import time
+import json
 from pathlib import Path
 from urllib.parse import urlparse, urljoin, parse_qs
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -13,24 +14,27 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 class StreamBot:
     def __init__(self):
-        self.current_time = "2025-06-14 05:29:05"
+        self.current_time = "2025-06-14 05:35:55"
         self.current_user = "harshMrDev"
         self.temp_dir = "/tmp/stream_downloads"
-        self.chunk_size = 1024 * 1024  # 1MB chunks
+        self.chunk_size = 1024 * 1024
         
-        # Enhanced headers for MediaDelivery
+        # Updated headers with all possible auth headers
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': '*/*',
             'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
             'Origin': 'https://iframe.mediadelivery.net',
             'Referer': 'https://iframe.mediadelivery.net/',
+            'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"Windows"',
             'Sec-Fetch-Dest': 'empty',
             'Sec-Fetch-Mode': 'cors',
             'Sec-Fetch-Site': 'same-origin',
             'Connection': 'keep-alive',
-            'Pragma': 'no-cache',
-            'Cache-Control': 'no-cache'
+            'Priority': 'u=1, i',
         }
         
         os.makedirs(self.temp_dir, exist_ok=True)
@@ -50,78 +54,161 @@ class StreamBot:
         )
 
     async def handle_url(self, update: Update, context):
-        """Handle incoming URLs"""
         url = update.message.text.strip()
         
         if not self._is_valid_url(url):
             await update.message.reply_text(
-                "❌ Please send a valid streaming URL:\n"
-                "1. MediaDelivery URL or\n"
-                "2. M3U8 URL"
+                "❌ Invalid URL format!\n\n"
+                "Send MediaDelivery or M3U8 URL"
             )
             return
 
-        msg = await update.message.reply_text(
-            "🔄 Processing your URL...\n"
-            "⏳ Please wait..."
-        )
+        msg = await update.message.reply_text("🔄 Processing URL...")
 
         try:
-            # Parse URL components
-            parsed_url = urlparse(url)
-            query_params = parse_qs(parsed_url.query)
-            
-            # Get required auth parameters
-            context_id = query_params.get('contextId', [''])[0]
-            token = query_params.get('token', [''])[0]
-            
-            # Update headers with auth
-            if context_id:
-                self.headers['X-Context-ID'] = context_id
-            if token:
-                self.headers['Authorization'] = f'Bearer {token}'
+            # Get auth tokens
+            auth_data = await self._get_auth_data(url)
+            if auth_data:
+                self.headers.update(auth_data)
 
-            # Get playlist
-            playlist_info = await self._get_playlist(url)
-            
-            # Create work directory
-            video_id = self._extract_video_id(url)
-            work_dir = Path(self.temp_dir) / video_id
-            work_dir.mkdir(parents=True, exist_ok=True)
+            # Get video info first
+            video_info = await self._get_video_info(url)
+            if not video_info:
+                raise Exception("Failed to get video info")
 
-            # Download segments
-            output_file = await self._download_segments(
-                playlist_info['segments'],
-                playlist_info['base_url'],
-                work_dir / f"{video_id}.mp4",
-                msg,
-                query_params
+            # Update message with video info
+            await msg.edit_text(
+                f"📥 Found video:\n"
+                f"Quality: {video_info.get('quality', 'N/A')}\n"
+                f"Duration: {video_info.get('duration', 'N/A')}s\n"
+                f"Starting download..."
             )
 
-            # Send video
+            # Download video
+            output_file = await self._process_download(url, msg, video_info)
+
+            # Send to Telegram
             await msg.edit_text("📤 Uploading to Telegram...")
             
             with open(output_file, 'rb') as video:
                 await update.message.reply_video(
                     video,
-                    caption=(
-                        f"✅ Download Complete!\n\n"
-                        f"🎥 Type: {'MediaDelivery' if 'mediadelivery.net' in url else 'M3U8'}\n"
-                        f"📊 Size: {os.path.getsize(output_file)/1024/1024:.1f}MB\n"
-                        f"🎯 Segments: {len(playlist_info['segments'])}\n"
-                        f"🕒 Time: {self.current_time}\n"
-                        f"👤 Handler: @{self.current_user}"
-                    ),
+                    caption=f"✅ Download Complete!\n"
+                           f"🎥 {video_info.get('quality', 'N/A')}\n"
+                           f"⏱️ {video_info.get('duration', 'N/A')}s\n"
+                           f"🕒 {self.current_time}\n"
+                           f"👤 @{self.current_user}",
                     supports_streaming=True
                 )
 
             # Cleanup
-            if os.path.exists(output_file):
-                os.remove(output_file)
+            os.remove(output_file)
             await msg.delete()
 
         except Exception as e:
             await msg.edit_text(f"❌ Error: {str(e)}")
+
+    async def _get_auth_data(self, url: str) -> dict:
+        """Get authentication data"""
+        try:
+            video_id = self._extract_video_id(url)
+            auth_url = f"https://iframe.mediadelivery.net/auth/{video_id}"
+            
+            async with aiohttp.ClientSession() as session:
+                # First request to get cookie
+                async with session.get(auth_url, ssl=False) as response:
+                    if response.status == 200:
+                        cookie = response.headers.get('Set-Cookie', '')
+                        
+                # Second request to get token
+                headers = {**self.headers, 'Cookie': cookie}
+                async with session.post(
+                    auth_url,
+                    headers=headers,
+                    json={"url": url},
+                    ssl=False
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return {
+                            'Authorization': f"Bearer {data.get('token')}",
+                            'Cookie': cookie,
+                            'X-CSRF-TOKEN': data.get('csrf_token', ''),
+                        }
+            return {}
+        except:
+            return {}
+
+    async def _get_video_info(self, url: str) -> dict:
+        """Get video information"""
+        try:
+            video_id = self._extract_video_id(url)
+            info_url = f"https://iframe.mediadelivery.net/embed/{video_id}/info"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(info_url, headers=self.headers, ssl=False) as response:
+                    if response.status == 200:
+                        return await response.json()
+            return {}
+        except:
+            return {}
+
+    async def _process_download(self, url: str, msg, video_info: dict) -> str:
+        """Process the download"""
+        video_id = self._extract_video_id(url)
+        work_dir = Path(self.temp_dir) / video_id
+        work_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Get playlist
+        playlist_info = await self._get_playlist(url)
+        if not playlist_info['segments']:
+            raise Exception("No segments found")
+
+        # Download segments
+        output_file = work_dir / f"{video_id}.mp4"
+        segment_files = []
+        total_segments = len(playlist_info['segments'])
+
+        async with aiohttp.ClientSession() as session:
+            for i, segment in enumerate(playlist_info['segments'], 1):
+                segment_url = urljoin(playlist_info['base_url'], segment.uri)
+                segment_file = work_dir / f"segment_{i}.ts"
+
+                # Try download with retries
+                success = False
+                for attempt in range(5):
+                    try:
+                        await self._download_segment(
+                            segment_url, 
+                            segment_file,
+                            session,
+                            attempt
+                        )
+                        segment_files.append(str(segment_file))
+                        success = True
+                        break
+                    except Exception as e:
+                        if attempt == 4:  # Last attempt
+                            raise Exception(f"Segment {i} failed: {str(e)}")
+                        await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                        await self._refresh_auth(url)  # Refresh auth between attempts
+
+                if success and i % max(1, total_segments // 20) == 0:
+                    await msg.edit_text(
+                        f"📥 Progress: {i}/{total_segments} segments\n"
+                        f"📊 {i/total_segments*100:.1f}%"
+                    )
+
+        # Merge segments
+        await msg.edit_text("🔄 Merging video...")
+        await self._merge_segments(segment_files, str(output_file))
+
+        # Cleanup segments
+        for file in segment_files:
+            if os.path.exists(file):
+                os.remove(file)
+
+        return str(output_file)
 
     async def _get_playlist(self, url: str) -> dict:
         """Get M3U8 playlist"""
@@ -147,60 +234,53 @@ class StreamBot:
                     "base_url": self._get_base_url(url)
                 }
 
-    async def _download_segments(self, segments, base_url: str, output_file: Path, msg, query_params: dict):
-        """Download and merge segments"""
-        segment_files = []
-        total_segments = len(segments)
-        retry_count = 5
-        retry_delays = [1, 2, 4, 8, 16]
-
-        async with aiohttp.ClientSession() as session:
-            for i, segment in enumerate(segments, 1):
-                segment_url = urljoin(base_url, segment.uri)
-                segment_file = output_file.parent / f"segment_{i}.ts"
-
-                # Add auth to segment URL
-                segment_url = self._add_auth_params(segment_url, query_params)
-
-                # Try download with retries
-                for attempt in range(retry_count):
-                    try:
-                        await self._download_segment(segment_url, segment_file, session)
-                        segment_files.append(str(segment_file))
-                        break
-                    except Exception as e:
-                        if attempt == retry_count - 1:
-                            raise Exception(f"Failed to download segment {i}: {str(e)}")
-                        await asyncio.sleep(retry_delays[attempt])
-                        await self._refresh_auth(segment_url)
-
-                # Update progress
-                if i % max(1, total_segments // 20) == 0:
-                    await msg.edit_text(
-                        f"📥 Downloading: {i}/{total_segments} segments\n"
-                        f"📊 Progress: {i/total_segments*100:.1f}%"
-                    )
-
-        # Merge segments
-        await msg.edit_text("🔄 Merging segments...")
-        await self._merge_segments(segment_files, str(output_file))
-
-        # Cleanup segments
-        for file in segment_files:
-            if os.path.exists(file):
-                os.remove(file)
-
-        return str(output_file)
-
-    async def _download_segment(self, url: str, file_path: Path, session: aiohttp.ClientSession):
-        """Download individual segment"""
-        async with session.get(url, headers=self.headers, ssl=False) as response:
-            if response.status != 200:
-                raise Exception(f"Status {response.status}")
+    async def _download_segment(self, url: str, file_path: Path, session: aiohttp.ClientSession, attempt: int):
+        """Download segment with enhanced error handling"""
+        try:
+            # Add attempt number to headers to avoid caching
+            headers = {**self.headers, 'X-Attempt': str(attempt)}
             
-            async with aiofiles.open(file_path, 'wb') as f:
-                async for chunk in response.content.iter_chunked(self.chunk_size):
-                    await f.write(chunk)
+            async with session.get(url, headers=headers, ssl=False) as response:
+                if response.status != 200:
+                    raise Exception(f"Status {response.status}")
+                
+                # Validate content
+                content_type = response.headers.get('Content-Type', '')
+                if not content_type.startswith(('video/', 'application/octet-stream')):
+                    raise Exception(f"Invalid content type: {content_type}")
+                
+                # Check content length
+                content_length = int(response.headers.get('Content-Length', 0))
+                if content_length < 100:  # Arbitrary minimum size
+                    raise Exception("Segment too small")
+                
+                async with aiofiles.open(file_path, 'wb') as f:
+                    async for chunk in response.content.iter_chunked(self.chunk_size):
+                        await f.write(chunk)
+                        
+                # Verify file size
+                if os.path.getsize(file_path) < 100:
+                    raise Exception("Downloaded segment too small")
+                    
+        except Exception as e:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            raise Exception(f"Download failed: {str(e)}")
+
+    async def _refresh_auth(self, url: str):
+        """Refresh auth token"""
+        try:
+            video_id = self._extract_video_id(url)
+            refresh_url = f"https://iframe.mediadelivery.net/auth/refresh/{video_id}"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(refresh_url, headers=self.headers, ssl=False) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if 'token' in data:
+                            self.headers['Authorization'] = f"Bearer {data['token']}"
+        except:
+            pass
 
     async def _merge_segments(self, segment_files: list, output_file: str):
         """Merge TS segments into MP4"""
@@ -224,35 +304,6 @@ class StreamBot:
         
         if os.path.exists(list_file):
             os.remove(list_file)
-
-    async def _refresh_auth(self, url: str):
-        """Refresh auth token"""
-        try:
-            video_id = self._extract_video_id(url)
-            refresh_url = f"https://iframe.mediadelivery.net/auth/refresh/{video_id}"
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(refresh_url, headers=self.headers, ssl=False) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if 'token' in data:
-                            self.headers['Authorization'] = f"Bearer {data['token']}"
-        except:
-            pass
-
-    def _add_auth_params(self, url: str, params: dict) -> str:
-        """Add auth params to URL"""
-        parsed = urlparse(url)
-        query_dict = parse_qs(parsed.query)
-        
-        for key, value in params.items():
-            if isinstance(value, list):
-                query_dict[key] = value[0]
-            else:
-                query_dict[key] = value
-
-        query_string = '&'.join(f"{k}={v}" for k, v in query_dict.items())
-        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}{'?' + query_string if query_string else ''}"
 
     def _is_valid_url(self, url: str) -> bool:
         """Validate URL format"""
