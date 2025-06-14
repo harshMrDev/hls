@@ -4,6 +4,8 @@ import m3u8
 import aiohttp
 import aiofiles
 import asyncio
+import hashlib
+import time
 from pathlib import Path
 from urllib.parse import urlparse, urljoin
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -11,10 +13,24 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 class StreamBot:
     def __init__(self):
-        self.current_time = "2025-06-14 05:09:22"
+        self.current_time = "2025-06-14 05:20:54"
         self.current_user = "harshMrDev"
         self.temp_dir = "/tmp/stream_downloads"
         self.chunk_size = 1024 * 1024  # 1MB chunks
+        
+        # Headers for MediaDelivery
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.81 Safari/537.36',
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Origin': 'https://iframe.mediadelivery.net',
+            'Referer': 'https://iframe.mediadelivery.net/',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-origin',
+            'Connection': 'keep-alive'
+        }
+        
         os.makedirs(self.temp_dir, exist_ok=True)
 
     async def start_command(self, update: Update, context):
@@ -47,23 +63,27 @@ class StreamBot:
         )
 
         try:
+            # Extract query parameters for MediaDelivery
+            query_params = {}
+            if "mediadelivery.net" in url:
+                query_params = dict(param.split('=') for param in urlparse(url).query.split('&') if '=' in param)
+
             # Process URL and get M3U8 info
-            playlist_info = await self._get_playlist(url)
+            playlist_info = await self._get_playlist(url, query_params)
             
-            # Create temp directory for this download
             video_id = self._extract_video_id(url)
             work_dir = Path(self.temp_dir) / video_id
             work_dir.mkdir(parents=True, exist_ok=True)
 
-            # Download all segments
+            # Download segments
             output_file = await self._download_segments(
                 playlist_info['segments'],
                 playlist_info['base_url'],
                 work_dir / f"{video_id}.mp4",
-                msg
+                msg,
+                query_params
             )
 
-            # Send video file
             await msg.edit_text("📤 Uploading to Telegram...")
             
             with open(output_file, 'rb') as video:
@@ -88,35 +108,55 @@ class StreamBot:
         except Exception as e:
             await msg.edit_text(f"❌ Error: {str(e)}")
 
-    async def _get_playlist(self, url: str) -> dict:
+    async def _get_playlist(self, url: str, query_params: dict) -> dict:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                if response.status != 200:
-                    raise Exception("Failed to fetch stream")
+            # Add query parameters to URL if they exist
+            if query_params:
+                url = f"{url}{'&' if '?' in url else '?'}" + '&'.join(f"{k}={v}" for k, v in query_params.items())
+
+            async with session.get(url, headers=self.headers) as response:
+                if response.status == 403:
+                    raise Exception("Access denied. Please check the URL or try again later.")
+                elif response.status != 200:
+                    raise Exception(f"Failed to fetch stream: {response.status}")
                 
                 m3u8_content = await response.text()
                 playlist = m3u8.loads(m3u8_content)
+                
+                if not playlist.segments:
+                    raise Exception("No video segments found in playlist")
                 
                 return {
                     "segments": playlist.segments,
                     "base_url": self._get_base_url(url)
                 }
 
-    async def _download_segments(self, segments, base_url: str, output_file: Path, msg):
+    async def _download_segments(self, segments, base_url: str, output_file: Path, msg, query_params: dict):
         segment_files = []
         total_segments = len(segments)
+        retry_count = 3  # Number of retries per segment
 
-        # Download segments
         async with aiohttp.ClientSession() as session:
             for i, segment in enumerate(segments, 1):
                 segment_url = urljoin(base_url, segment.uri)
                 segment_file = output_file.parent / f"segment_{i}.ts"
                 
-                # Download segment
-                await self._download_segment(segment_url, segment_file, session)
-                segment_files.append(str(segment_file))
+                # Add query parameters to segment URL if they exist
+                if query_params:
+                    segment_url = f"{segment_url}{'&' if '?' in segment_url else '?'}" + '&'.join(f"{k}={v}" for k, v in query_params.items())
 
-                # Update progress every 5%
+                # Try downloading with retries
+                for attempt in range(retry_count):
+                    try:
+                        await self._download_segment(segment_url, segment_file, session)
+                        segment_files.append(str(segment_file))
+                        break
+                    except Exception as e:
+                        if attempt == retry_count - 1:  # Last attempt
+                            raise Exception(f"Failed to download segment {i} after {retry_count} attempts")
+                        await asyncio.sleep(1)  # Wait before retry
+
+                # Update progress
                 if i % max(1, total_segments // 20) == 0:
                     await msg.edit_text(
                         f"📥 Downloading: {i}/{total_segments} segments\n"
@@ -135,8 +175,10 @@ class StreamBot:
         return str(output_file)
 
     async def _download_segment(self, url: str, file_path: Path, session: aiohttp.ClientSession):
-        async with session.get(url) as response:
-            if response.status != 200:
+        async with session.get(url, headers=self.headers) as response:
+            if response.status == 403:
+                raise Exception("Access denied for segment. Please check URL or try again.")
+            elif response.status != 200:
                 raise Exception(f"Failed to download segment: {response.status}")
             
             async with aiofiles.open(file_path, 'wb') as f:
@@ -144,13 +186,11 @@ class StreamBot:
                     await f.write(chunk)
 
     async def _merge_segments(self, segment_files: list, output_file: str):
-        # Create file list for FFmpeg
         list_file = f"{output_file}.txt"
         with open(list_file, 'w') as f:
             for file in segment_files:
                 f.write(f"file '{file}'\n")
 
-        # Merge using FFmpeg
         process = await asyncio.create_subprocess_exec(
             'ffmpeg',
             '-f', 'concat',
@@ -164,7 +204,6 @@ class StreamBot:
         
         await process.communicate()
         
-        # Cleanup list file
         if os.path.exists(list_file):
             os.remove(list_file)
 
