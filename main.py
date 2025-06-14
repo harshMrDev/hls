@@ -7,12 +7,13 @@ import asyncio
 import hashlib
 import time
 import shutil
+from urllib.parse import urljoin  # <-- Fix: Import urljoin!
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 class StreamBot:
     def __init__(self):
-        self.current_time = "2025-06-14 12:28:50"
+        self.current_time = "2025-06-14 13:00:50"
         self.current_user = "harshMrDev"
         self.base_dir = "/tmp/stream_downloads"
         self.chunk_size = 1024 * 1024  # 1MB chunks
@@ -144,7 +145,7 @@ class StreamBot:
                                 raise Exception(f"Failed to download segment {i}: {e}")
                             await asyncio.sleep(1)
                     progress = int((i / total_segments) * 100)
-                    if progress > last_progress:
+                    if progress > last_progress or i == total_segments:
                         await msg.edit_text(
                             f"📥 Downloading: {i}/{total_segments} segments\n"
                             f"📊 Progress: {progress}%"
@@ -156,12 +157,11 @@ class StreamBot:
 
             total_mb = sum(os.path.getsize(f) for f in segment_files) / (1024 * 1024)
             await msg.edit_text(
-                f"🔄 Merging video segments (no FFmpeg concat bug) ...\n"
+                f"🔄 Merging video segments...\n"
                 f"📦 Total size: {total_mb:.1f}MB\n"
                 f"⌛ Please wait..."
             )
 
-            # --- Robust merge: binary concat all .ts, then ffmpeg transcode to mp4 ---
             concat_file = os.path.join(work_dir, "all_segments.ts")
             with open(concat_file, 'wb') as outfile:
                 for seg in segment_files:
@@ -224,7 +224,8 @@ class StreamBot:
         return hashlib.md5(url.encode()).hexdigest()[:12]
 
     def _get_base_url(self, url: str) -> str:
-        return '/'.join(url.split('/')[:-1])
+        # Use rsplit to ensure base URL is correct for urljoin
+        return url.rsplit('/', 1)[0] + '/'
 
 def main():
     bot = StreamBot()
