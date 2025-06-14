@@ -14,7 +14,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 class StreamBot:
     def __init__(self):
-        self.current_time = "2025-06-14 07:43:10"
+        self.current_time = "2025-06-14 11:46:27"
         self.current_user = "harshMrDev"
         self.base_dir = "/tmp/stream_downloads"
         self.chunk_size = 1024 * 1024  # 1MB chunks
@@ -146,7 +146,6 @@ class StreamBot:
                 }
 
     async def _download_segments(self, segments, base_url: str, output_file: str, work_dir: str, msg):
-        """Download and merge segments with enhanced progress reporting"""
         segment_files = []
         total_segments = len(segments)
         last_progress = 0
@@ -155,25 +154,29 @@ class StreamBot:
             async with aiohttp.ClientSession() as session:
                 for i, segment in enumerate(segments, 1):
                     segment_url = urljoin(base_url, segment.uri)
-                    segment_path = os.path.join(work_dir, f"segment_{i:03d}.ts")
+                    segment_path = os.path.abspath(os.path.join(work_dir, f"segment_{i:03d}.ts"))
                     
                     # Try download with retries
                     success = False
                     for attempt in range(3):
                         try:
                             await self._download_segment(segment_url, segment_path, session)
-                            segment_files.append(segment_path)
-                            success = True
-                            break
+                            
+                            # Verify downloaded segment
+                            if os.path.exists(segment_path) and os.path.getsize(segment_path) > 0:
+                                segment_files.append(segment_path)
+                                success = True
+                                break
+                            
                         except Exception as e:
-                            if attempt == 2:  # Last attempt
+                            if attempt == 2:
                                 raise Exception(f"Segment {i} failed after 3 attempts")
-                            await asyncio.sleep(2)  # Longer delay between retries
+                            await asyncio.sleep(2)
 
                     if not success:
                         raise Exception(f"Failed to download segment {i}")
 
-                    # Update progress more frequently
+                    # Update progress
                     progress = int((i / total_segments) * 100)
                     if progress > last_progress:
                         await msg.edit_text(
@@ -183,13 +186,10 @@ class StreamBot:
                         last_progress = progress
 
             # Verify all segments
-            if len(segment_files) != total_segments:
-                raise Exception(f"Missing segments: {total_segments - len(segment_files)}")
-
-            # Calculate total size
-            total_size = sum(os.path.getsize(f) for f in segment_files)
-            if total_size < 1024:  # Less than 1KB total
-                raise Exception("Total segments too small")
+            expected_count = total_segments
+            actual_count = len(segment_files)
+            if actual_count != expected_count:
+                raise Exception(f"Segment count mismatch: expected {expected_count}, got {actual_count}")
 
             # Merge segments
             await msg.edit_text(
@@ -197,14 +197,6 @@ class StreamBot:
                 "⏳ This might take a few minutes..."
             )
             await self._merge_segments(segment_files, output_file)
-
-            # Verify merged output
-            if not os.path.exists(output_file):
-                raise Exception("Merge failed - output file not found")
-
-            merged_size = os.path.getsize(output_file)
-            if merged_size < total_size * 0.5:  # At least 50% of total segment size
-                raise Exception("Merged file suspiciously small")
 
         except Exception as e:
             # Cleanup on error
@@ -230,64 +222,114 @@ class StreamBot:
         try:
             list_file = f"{output_file}.txt"
             
-            # Create FFmpeg concat file
-            with open(list_file, 'w') as f:
-                for file in segment_files:
-                    # Ensure proper path format for FFmpeg
-                    safe_path = file.replace("'", "'\\''")
-                    f.write(f"file '{safe_path}'\n")
+            # Verify segments exist before creating concat file
+            existing_segments = []
+            for segment in segment_files:
+                if os.path.exists(segment) and os.path.getsize(segment) > 0:
+                    # Use absolute paths and escape spaces
+                    abs_path = os.path.abspath(segment)
+                    existing_segments.append(abs_path)
+                else:
+                    raise Exception(f"Missing or empty segment: {segment}")
 
-            # FFmpeg command with detailed parameters
+            if not existing_segments:
+                raise Exception("No valid segments to merge")
+
+            # Create FFmpeg concat file with absolute paths
+            with open(list_file, 'w', encoding='utf-8') as f:
+                for file in existing_segments:
+                    # Properly escape the path for FFmpeg
+                    escaped_path = file.replace("'", "'\\''").replace('\\', '\\\\')
+                    f.write(f"file '{escaped_path}'\n")
+
+            # Verify concat file
+            if not os.path.exists(list_file) or os.path.getsize(list_file) == 0:
+                raise Exception("Failed to create concat file")
+
+            # First try with concat demuxer
             cmd = [
                 'ffmpeg',
                 '-f', 'concat',
                 '-safe', '0',
                 '-i', list_file,
                 '-c', 'copy',
-                '-movflags', '+faststart',  # Enable streaming
-                '-y',  # Overwrite output file
+                '-movflags', '+faststart',
+                '-y',
                 output_file
             ]
 
-            # Run FFmpeg with proper error handling
+            # Run FFmpeg
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
 
-            # Wait for FFmpeg to complete with timeout
             try:
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(),
-                    timeout=300  # 5 minutes timeout
+                    timeout=300
                 )
             except asyncio.TimeoutError:
-                # Kill FFmpeg if it takes too long
-                try:
-                    process.kill()
-                except:
-                    pass
+                if process:
+                    try:
+                        process.kill()
+                    except:
+                        pass
                 raise Exception("FFmpeg merge timeout")
 
-            # Check FFmpeg exit code
+            # If concat demuxer fails, try alternative method
             if process.returncode != 0:
-                error_msg = stderr.decode().strip() if stderr else "Unknown FFmpeg error"
-                raise Exception(f"FFmpeg failed: {error_msg}")
+                # Create a file list for direct concatenation
+                segment_list = '|'.join(existing_segments)
+                
+                cmd = [
+                    'ffmpeg',
+                    '-i', f"concat:{segment_list}",
+                    '-c', 'copy',
+                    '-movflags', '+faststart',
+                    '-y',
+                    output_file
+                ]
 
-            # Verify output file
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+
+                try:
+                    stdout, stderr = await asyncio.wait_for(
+                        process.communicate(),
+                        timeout=300
+                    )
+                except asyncio.TimeoutError:
+                    if process:
+                        try:
+                            process.kill()
+                        except:
+                            pass
+                    raise Exception("FFmpeg alternative merge timeout")
+
+                if process.returncode != 0:
+                    error_msg = stderr.decode().strip() if stderr else "Unknown FFmpeg error"
+                    raise Exception(f"Both merge methods failed: {error_msg}")
+
+            # Verify output
             if not os.path.exists(output_file):
                 raise Exception("Merged file not found")
 
-            file_size = os.path.getsize(output_file)
-            if file_size < 1024:  # Less than 1KB
+            output_size = os.path.getsize(output_file)
+            total_input_size = sum(os.path.getsize(f) for f in existing_segments)
+
+            if output_size < total_input_size * 0.5:
                 raise Exception("Merged file too small")
 
         except Exception as e:
             raise Exception(f"Merge failed: {str(e)}")
 
         finally:
-            # Cleanup list file
+            # Cleanup
             if os.path.exists(list_file):
                 try:
                     os.remove(list_file)
