@@ -7,24 +7,24 @@ import asyncio
 import hashlib
 import time
 import shutil
-from urllib.parse import urljoin  # <-- Fix: Import urljoin!
+from urllib.parse import urljoin
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 class StreamBot:
     def __init__(self):
-        self.current_time = "2025-06-14 13:00:50"
+        self.current_time = "2025-06-14 13:09:29"
         self.current_user = "harshMrDev"
         self.base_dir = "/tmp/stream_downloads"
-        self.chunk_size = 1024 * 1024  # 1MB chunks
-        
+        self.chunk_size = 1024 * 1024
+
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': '*/*',
             'Origin': 'https://iframe.mediadelivery.net',
             'Referer': 'https://iframe.mediadelivery.net/',
         }
-        
+
         if os.path.exists(self.base_dir):
             shutil.rmtree(self.base_dir)
         os.makedirs(self.base_dir)
@@ -39,7 +39,7 @@ class StreamBot:
 
     async def handle_url(self, update: Update, context):
         url = update.message.text.strip()
-        
+
         if not self._is_valid_url(url):
             await update.message.reply_text("❌ Send a valid streaming URL")
             return
@@ -79,8 +79,8 @@ class StreamBot:
                 await update.message.reply_video(
                     video,
                     caption=f"✅ Download Complete!\n"
-                           f"🕒 {self.current_time}\n"
-                           f"👤 @{self.current_user}",
+                            f"🕒 {self.current_time}\n"
+                            f"👤 @{self.current_user}",
                     supports_streaming=True
                 )
 
@@ -157,21 +157,26 @@ class StreamBot:
 
             total_mb = sum(os.path.getsize(f) for f in segment_files) / (1024 * 1024)
             await msg.edit_text(
-                f"🔄 Merging video segments...\n"
+                f"🔄 Merging video segments (concat demuxer)...\n"
                 f"📦 Total size: {total_mb:.1f}MB\n"
                 f"⌛ Please wait..."
             )
 
-            concat_file = os.path.join(work_dir, "all_segments.ts")
-            with open(concat_file, 'wb') as outfile:
+            # Create FFmpeg concat demuxer file
+            concat_list_file = os.path.join(work_dir, "concat_list.txt")
+            with open(concat_list_file, "w") as f:
                 for seg in segment_files:
-                    with open(seg, 'rb') as infile:
-                        shutil.copyfileobj(infile, outfile, length=1024*1024)
+                    # FFmpeg concat demuxer requires path like: file '/path/to/segment_00001.ts'
+                    f.write("file '{}'\n".format(os.path.abspath(seg).replace("'", "'\\''")))
 
             cmd = [
                 'ffmpeg',
+                '-hide_banner',
                 '-y',
-                '-i', concat_file,
+                '-f', 'concat',
+                '-safe', '0',
+                '-protocol_whitelist', 'file,http,https,tcp,tls',
+                '-i', concat_list_file,
                 '-c', 'copy',
                 '-bsf:a', 'aac_adtstoasc',
                 '-movflags', '+faststart',
@@ -191,8 +196,8 @@ class StreamBot:
                 raise Exception("Merged file not found after FFmpeg")
 
             # Cleanup
-            if os.path.exists(concat_file):
-                os.remove(concat_file)
+            if os.path.exists(concat_list_file):
+                os.remove(concat_list_file)
             for seg in segment_files:
                 if os.path.exists(seg):
                     os.remove(seg)
@@ -224,7 +229,6 @@ class StreamBot:
         return hashlib.md5(url.encode()).hexdigest()[:12]
 
     def _get_base_url(self, url: str) -> str:
-        # Use rsplit to ensure base URL is correct for urljoin
         return url.rsplit('/', 1)[0] + '/'
 
 def main():
