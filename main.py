@@ -14,7 +14,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 class StreamBot:
     def __init__(self):
-        self.current_time = "2025-06-14 05:51:10"
+        self.current_time = "2025-06-14 07:43:10"
         self.current_user = "harshMrDev"
         self.base_dir = "/tmp/stream_downloads"
         self.chunk_size = 1024 * 1024  # 1MB chunks
@@ -23,8 +23,13 @@ class StreamBot:
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
             'Origin': 'https://iframe.mediadelivery.net',
             'Referer': 'https://iframe.mediadelivery.net/',
+            'Connection': 'keep-alive',
+            'Pragma': 'no-cache',
+            'Cache-Control': 'no-cache',
         }
         
         # Create base directory
@@ -141,48 +146,75 @@ class StreamBot:
                 }
 
     async def _download_segments(self, segments, base_url: str, output_file: str, work_dir: str, msg):
+        """Download and merge segments with enhanced progress reporting"""
         segment_files = []
         total_segments = len(segments)
+        last_progress = 0
 
-        async with aiohttp.ClientSession() as session:
-            for i, segment in enumerate(segments, 1):
-                segment_url = urljoin(base_url, segment.uri)
-                segment_path = os.path.join(work_dir, f"segment_{i:03d}.ts")
-                
-                # Try download with retries
-                for attempt in range(3):
+        try:
+            async with aiohttp.ClientSession() as session:
+                for i, segment in enumerate(segments, 1):
+                    segment_url = urljoin(base_url, segment.uri)
+                    segment_path = os.path.join(work_dir, f"segment_{i:03d}.ts")
+                    
+                    # Try download with retries
+                    success = False
+                    for attempt in range(3):
+                        try:
+                            await self._download_segment(segment_url, segment_path, session)
+                            segment_files.append(segment_path)
+                            success = True
+                            break
+                        except Exception as e:
+                            if attempt == 2:  # Last attempt
+                                raise Exception(f"Segment {i} failed after 3 attempts")
+                            await asyncio.sleep(2)  # Longer delay between retries
+
+                    if not success:
+                        raise Exception(f"Failed to download segment {i}")
+
+                    # Update progress more frequently
+                    progress = int((i / total_segments) * 100)
+                    if progress > last_progress:
+                        await msg.edit_text(
+                            f"📥 Downloading: {i}/{total_segments} segments\n"
+                            f"📊 Progress: {progress}%"
+                        )
+                        last_progress = progress
+
+            # Verify all segments
+            if len(segment_files) != total_segments:
+                raise Exception(f"Missing segments: {total_segments - len(segment_files)}")
+
+            # Calculate total size
+            total_size = sum(os.path.getsize(f) for f in segment_files)
+            if total_size < 1024:  # Less than 1KB total
+                raise Exception("Total segments too small")
+
+            # Merge segments
+            await msg.edit_text(
+                "🔄 Merging video segments...\n"
+                "⏳ This might take a few minutes..."
+            )
+            await self._merge_segments(segment_files, output_file)
+
+            # Verify merged output
+            if not os.path.exists(output_file):
+                raise Exception("Merge failed - output file not found")
+
+            merged_size = os.path.getsize(output_file)
+            if merged_size < total_size * 0.5:  # At least 50% of total segment size
+                raise Exception("Merged file suspiciously small")
+
+        except Exception as e:
+            # Cleanup on error
+            for file in segment_files:
+                if os.path.exists(file):
                     try:
-                        await self._download_segment(segment_url, segment_path, session)
-                        segment_files.append(segment_path)
-                        break
-                    except Exception as e:
-                        if attempt == 2:  # Last attempt
-                            raise Exception(f"Failed to download segment {i}")
-                        await asyncio.sleep(1)
-
-                # Update progress every 5%
-                if i % max(1, total_segments // 20) == 0:
-                    await msg.edit_text(
-                        f"📥 Progress: {i}/{total_segments}\n"
-                        f"📊 {i/total_segments*100:.1f}%"
-                    )
-
-        # Verify all segments were downloaded
-        if len(segment_files) != total_segments:
-            raise Exception("Some segments are missing")
-
-        # Merge segments
-        await msg.edit_text("🔄 Merging...")
-        await self._merge_segments(segment_files, output_file)
-
-        # Verify merged file
-        if not os.path.exists(output_file):
-            raise Exception("Failed to merge segments")
-
-        # Cleanup segments
-        for file in segment_files:
-            if os.path.exists(file):
-                os.remove(file)
+                        os.remove(file)
+                    except:
+                        pass
+            raise e
 
     async def _download_segment(self, url: str, file_path: str, session: aiohttp.ClientSession):
         async with session.get(url, headers=self.headers, ssl=False) as response:
@@ -194,34 +226,73 @@ class StreamBot:
                     await f.write(chunk)
 
     async def _merge_segments(self, segment_files: list, output_file: str):
-        list_file = f"{output_file}.txt"
-        
-        # Create file list
-        with open(list_file, 'w') as f:
-            for file in segment_files:
-                f.write(f"file '{file}'\n")
-
-        # Merge using FFmpeg
-        process = await asyncio.create_subprocess_exec(
-            'ffmpeg',
-            '-f', 'concat',
-            '-safe', '0',
-            '-i', list_file,
-            '-c', 'copy',
-            output_file,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        
-        await process.communicate()
-        
-        # Cleanup list file
-        if os.path.exists(list_file):
-            os.remove(list_file)
+        """Merge TS segments into MP4 with enhanced FFmpeg handling"""
+        try:
+            list_file = f"{output_file}.txt"
             
-        # Verify output file
-        if not os.path.exists(output_file):
-            raise Exception("FFmpeg failed to merge segments")
+            # Create FFmpeg concat file
+            with open(list_file, 'w') as f:
+                for file in segment_files:
+                    # Ensure proper path format for FFmpeg
+                    safe_path = file.replace("'", "'\\''")
+                    f.write(f"file '{safe_path}'\n")
+
+            # FFmpeg command with detailed parameters
+            cmd = [
+                'ffmpeg',
+                '-f', 'concat',
+                '-safe', '0',
+                '-i', list_file,
+                '-c', 'copy',
+                '-movflags', '+faststart',  # Enable streaming
+                '-y',  # Overwrite output file
+                output_file
+            ]
+
+            # Run FFmpeg with proper error handling
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            # Wait for FFmpeg to complete with timeout
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=300  # 5 minutes timeout
+                )
+            except asyncio.TimeoutError:
+                # Kill FFmpeg if it takes too long
+                try:
+                    process.kill()
+                except:
+                    pass
+                raise Exception("FFmpeg merge timeout")
+
+            # Check FFmpeg exit code
+            if process.returncode != 0:
+                error_msg = stderr.decode().strip() if stderr else "Unknown FFmpeg error"
+                raise Exception(f"FFmpeg failed: {error_msg}")
+
+            # Verify output file
+            if not os.path.exists(output_file):
+                raise Exception("Merged file not found")
+
+            file_size = os.path.getsize(output_file)
+            if file_size < 1024:  # Less than 1KB
+                raise Exception("Merged file too small")
+
+        except Exception as e:
+            raise Exception(f"Merge failed: {str(e)}")
+
+        finally:
+            # Cleanup list file
+            if os.path.exists(list_file):
+                try:
+                    os.remove(list_file)
+                except:
+                    pass
 
     def _is_valid_url(self, url: str) -> bool:
         return ("mediadelivery.net" in url and "/video" in url) or url.endswith(".m3u8")
