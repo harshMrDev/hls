@@ -2,5 +2,4 @@ python-telegram-bot
 aiohttp
 aiofiles
 m3u8
-ffmpeg-python
 python-dotenv
