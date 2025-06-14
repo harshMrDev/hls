@@ -7,32 +7,23 @@ import asyncio
 import hashlib
 import time
 import shutil
-from pathlib import Path
-from urllib.parse import urlparse, urljoin
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 class StreamBot:
     def __init__(self):
-        self.current_time = "2025-06-14 12:21:43"
+        self.current_time = "2025-06-14 12:28:50"
         self.current_user = "harshMrDev"
         self.base_dir = "/tmp/stream_downloads"
         self.chunk_size = 1024 * 1024  # 1MB chunks
         
-        # Essential headers
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': '*/*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
             'Origin': 'https://iframe.mediadelivery.net',
             'Referer': 'https://iframe.mediadelivery.net/',
-            'Connection': 'keep-alive',
-            'Pragma': 'no-cache',
-            'Cache-Control': 'no-cache',
         }
         
-        # Create base directory
         if os.path.exists(self.base_dir):
             shutil.rmtree(self.base_dir)
         os.makedirs(self.base_dir)
@@ -55,27 +46,23 @@ class StreamBot:
         msg = await update.message.reply_text("🔄 Processing...")
 
         try:
-            # Create work directory
             video_id = self._extract_video_id(url)
             work_dir = os.path.join(self.base_dir, video_id)
             if os.path.exists(work_dir):
                 shutil.rmtree(work_dir)
             os.makedirs(work_dir)
 
-            # Get auth token if needed
             if "mediadelivery.net" in url:
                 token = await self._get_token(url)
                 if token:
                     self.headers['Authorization'] = f'Bearer {token}'
 
-            # Get playlist info
             playlist_info = await self._get_playlist(url)
             if not playlist_info or not playlist_info['segments']:
                 raise Exception("No segments found in playlist")
 
-            # Download segments
             output_file = os.path.join(work_dir, f"{video_id}.mp4")
-            await self._download_segments(
+            await self._download_and_merge(
                 playlist_info['segments'],
                 playlist_info['base_url'],
                 output_file,
@@ -83,13 +70,10 @@ class StreamBot:
                 msg
             )
 
-            # Verify file exists
             if not os.path.exists(output_file):
                 raise Exception("Failed to create output file")
 
-            # Send video
             await msg.edit_text("📤 Uploading...")
-            
             with open(output_file, 'rb') as video:
                 await update.message.reply_video(
                     video,
@@ -99,13 +83,11 @@ class StreamBot:
                     supports_streaming=True
                 )
 
-            # Cleanup
             shutil.rmtree(work_dir)
             await msg.delete()
 
         except Exception as e:
             await msg.edit_text(f"❌ Error: {str(e)}")
-            # Cleanup on error
             if 'work_dir' in locals() and os.path.exists(work_dir):
                 shutil.rmtree(work_dir)
 
@@ -113,7 +95,6 @@ class StreamBot:
         try:
             video_id = self._extract_video_id(url)
             auth_url = f"https://iframe.mediadelivery.net/auth/{video_id}/token"
-            
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     auth_url,
@@ -133,20 +114,16 @@ class StreamBot:
             async with session.get(url, headers=self.headers, ssl=False) as response:
                 if response.status != 200:
                     raise Exception(f"Failed to get playlist: {response.status}")
-                
                 m3u8_content = await response.text()
                 playlist = m3u8.loads(m3u8_content)
-                
                 if not playlist.segments:
                     raise Exception("Empty playlist")
-                
                 return {
                     "segments": playlist.segments,
                     "base_url": self._get_base_url(url)
                 }
 
-    async def _download_segments(self, segments, base_url: str, output_file: str, work_dir: str, msg):
-        """Download and merge segments with enhanced progress reporting"""
+    async def _download_and_merge(self, segments, base_url: str, output_file: str, work_dir: str, msg):
         segment_files = []
         total_segments = len(segments)
         last_progress = 0
@@ -155,9 +132,7 @@ class StreamBot:
             async with aiohttp.ClientSession() as session:
                 for i, segment in enumerate(segments, 1):
                     segment_url = urljoin(base_url, segment.uri)
-                    segment_path = os.path.join(work_dir, f"segment_{i:03d}.ts")
-                    
-                    # Try download with retries
+                    segment_path = os.path.join(work_dir, f"segment_{i:05d}.ts")
                     for attempt in range(3):
                         try:
                             await self._download_segment(segment_url, segment_path, session)
@@ -165,11 +140,9 @@ class StreamBot:
                                 segment_files.append(segment_path)
                                 break
                         except Exception as e:
-                            if attempt == 2:  # Last attempt
-                                raise Exception(f"Failed to download segment {i}")
+                            if attempt == 2:
+                                raise Exception(f"Failed to download segment {i}: {e}")
                             await asyncio.sleep(1)
-
-                    # Update progress
                     progress = int((i / total_segments) * 100)
                     if progress > last_progress:
                         await msg.edit_text(
@@ -178,24 +151,53 @@ class StreamBot:
                         )
                         last_progress = progress
 
-            # Verify segments
             if len(segment_files) != total_segments:
                 raise Exception(f"Missing segments: got {len(segment_files)}, expected {total_segments}")
 
-            # Calculate total size and estimate time
             total_mb = sum(os.path.getsize(f) for f in segment_files) / (1024 * 1024)
-            
             await msg.edit_text(
-                f"🔄 Merging video segments...\n"
+                f"🔄 Merging video segments (no FFmpeg concat bug) ...\n"
                 f"📦 Total size: {total_mb:.1f}MB\n"
                 f"⌛ Please wait..."
             )
 
-            # Merge segments
-            await self._merge_segments(segment_files, output_file)
+            # --- Robust merge: binary concat all .ts, then ffmpeg transcode to mp4 ---
+            concat_file = os.path.join(work_dir, "all_segments.ts")
+            with open(concat_file, 'wb') as outfile:
+                for seg in segment_files:
+                    with open(seg, 'rb') as infile:
+                        shutil.copyfileobj(infile, outfile, length=1024*1024)
+
+            cmd = [
+                'ffmpeg',
+                '-y',
+                '-i', concat_file,
+                '-c', 'copy',
+                '-bsf:a', 'aac_adtstoasc',
+                '-movflags', '+faststart',
+                output_file
+            ]
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                raise Exception(f"FFmpeg error: {stderr.decode().strip()}")
+
+            if not os.path.exists(output_file):
+                raise Exception("Merged file not found after FFmpeg")
+
+            # Cleanup
+            if os.path.exists(concat_file):
+                os.remove(concat_file)
+            for seg in segment_files:
+                if os.path.exists(seg):
+                    os.remove(seg)
 
         except Exception as e:
-            # Cleanup on error
             for file in segment_files:
                 if os.path.exists(file):
                     try:
@@ -208,64 +210,9 @@ class StreamBot:
         async with session.get(url, headers=self.headers, ssl=False) as response:
             if response.status != 200:
                 raise Exception(f"Status {response.status}")
-            
             async with aiofiles.open(file_path, 'wb') as f:
                 async for chunk in response.content.iter_chunked(self.chunk_size):
                     await f.write(chunk)
-
-    async def _merge_segments(self, segment_files: list, output_file: str):
-        """Merge TS segments into MP4 with enhanced FFmpeg handling"""
-        try:
-            # First try direct TS concatenation (fastest method)
-            concat_file = f"{output_file}.ts"
-            try:
-                # Concatenate TS files directly
-                with open(concat_file, 'wb') as outfile:
-                    for segment in segment_files:
-                        if os.path.exists(segment):
-                            with open(segment, 'rb') as infile:
-                                shutil.copyfileobj(infile, outfile, length=1024*1024)
-
-                # Convert concatenated TS to MP4
-                cmd = [
-                    'ffmpeg',
-                    '-y',  # Overwrite output
-                    '-i', concat_file,  # Input file
-                    '-c', 'copy',  # Copy without re-encoding
-                    '-bsf:a', 'aac_adtstoasc',  # Fix audio bitstream
-                    '-movflags', '+faststart',  # Optimize for streaming
-                    output_file  # Output file
-                ]
-
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-
-                stdout, stderr = await process.communicate()
-
-                if process.returncode != 0:
-                    raise Exception(f"FFmpeg error: {stderr.decode().strip()}")
-
-            finally:
-                # Cleanup concatenated TS file
-                if os.path.exists(concat_file):
-                    os.remove(concat_file)
-
-            # Verify output
-            if not os.path.exists(output_file):
-                raise Exception("Merged file not found")
-
-            # Verify file size
-            output_size = os.path.getsize(output_file)
-            total_input_size = sum(os.path.getsize(f) for f in segment_files)
-
-            if output_size < total_input_size * 0.5:
-                raise Exception("Merged file too small")
-
-        except Exception as e:
-            raise Exception(f"Merge failed: {str(e)}")
 
     def _is_valid_url(self, url: str) -> bool:
         return ("mediadelivery.net" in url and "/video" in url) or url.endswith(".m3u8")
@@ -280,19 +227,15 @@ class StreamBot:
         return '/'.join(url.split('/')[:-1])
 
 def main():
-    """Start the bot"""
     bot = StreamBot()
     app = Application.builder().token(os.getenv('BOT_TOKEN')).build()
-    
     app.add_handler(CommandHandler("start", bot.start_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_url))
-    
     print(f"""
     🤖 Starting Stream Downloader Bot
     ⏰ Time: {bot.current_time}
     👤 Handler: @{bot.current_user}
     """)
-    
     app.run_polling()
 
 if __name__ == "__main__":
